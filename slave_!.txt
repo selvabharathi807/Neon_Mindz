@@ -1,0 +1,166 @@
+#include <WiFi.h>
+#include "painlessMesh.h"
+#include <DNSServer.h>
+#include <WebServer.h>
+
+#define   MESH_PREFIX     "EMERGENCY_RESCUE" 
+#define   MESH_PASSWORD   ""                 
+#define   MESH_PORT       5555
+
+Scheduler userScheduler;
+painlessMesh  mesh;
+
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
+WebServer server(80);
+
+String latestServerMessage = "";
+
+// --- UPDATED HTML/JS FOR GLOBAL GROUP CHAT ---
+String index_html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HOP Rescue Network</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f8f9fa; color: #333; margin: 0; padding: 10px; text-align: center; }
+    .container { max-width: 400px; margin: auto; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+    h2 { color: #d9534f; margin-top: 0; }
+    input, select, textarea { width: 100%; padding: 10px; margin-top: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 16px;}
+    button { background-color: #d9534f; color: white; padding: 12px; border: none; border-radius: 5px; cursor: pointer; margin-top: 15px; width: 100%; font-size: 16px; font-weight: bold;}
+    button:hover { background-color: #c9302c; }
+    #chat-interface { display: none; text-align: left; }
+    #chat-box { height: 200px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #fafafa; margin-top: 10px; border-radius: 4px; }
+    .msg { margin-bottom: 8px; padding: 8px; border-radius: 5px; background: #e9ecef; }
+    .my-msg { background: #dff0d8; text-align: right; }
+    .server-msg { background: #d9edf7; border-left: 4px solid #31708f; }
+  </style>
+</head>
+<body>
+  <div class="container" id="login-interface">
+    <h2>HOP Rescue Network</h2>
+    <p>Please register to access the local mesh.</p>
+    <select id="role">
+      <option value="Victim">I need help (Victim)</option>
+      <option value="Volunteer">I can help (Volunteer)</option>
+    </select>
+    <input type="text" id="username" placeholder="Enter your name">
+    <button onclick="joinNetwork()">Connect to Mesh</button>
+  </div>
+
+  <div class="container" id="chat-interface">
+    <h2>Global Rescue Chat</h2>
+    <div id="chat-box"></div>
+    <input type="text" id="message" placeholder="Type a message...">
+    <button onclick="sendMessage()">Send</button>
+  </div>
+
+  <script>
+    let myName = "";
+    let myRole = "";
+    let lastPolledMsg = "";
+
+    function joinNetwork() {
+      myName = document.getElementById("username").value.trim();
+      myRole = document.getElementById("role").value;
+      if(myName === "") { alert("Please enter a name"); return; }
+      
+      document.getElementById("login-interface").style.display = "none";
+      document.getElementById("chat-interface").style.display = "block";
+      
+      sendToServer("System", myName + " joined as " + myRole);
+      setInterval(pollMessages, 2000);
+    }
+
+    function sendMessage() {
+      let msgInput = document.getElementById("message");
+      let text = msgInput.value.trim();
+      if(text === "") return;
+      
+      addChatBubble("You", text, "my-msg");
+      sendToServer(myName + " (" + myRole + ")", text);
+      msgInput.value = "";
+    }
+
+    function sendToServer(sender, text) {
+      let payload = JSON.stringify({ sender: sender, message: text });
+      lastPolledMsg = payload; // Prevents the phone from echoing its own message twice
+      fetch('/send', { method: 'POST', body: payload });
+    }
+
+    function pollMessages() {
+      fetch('/receive').then(res => res.text()).then(data => {
+        if(data !== "" && data !== lastPolledMsg) {
+          lastPolledMsg = data;
+          
+          // NEW LOGIC: Check if message is from another phone or the Data Center
+          try {
+            let parsed = JSON.parse(data);
+            addChatBubble(parsed.sender, parsed.message, "server-msg");
+          } catch(e) {
+            // If it's not JSON, it came directly from the Data Center laptop
+            addChatBubble("Data Center", data, "server-msg");
+          }
+        }
+      });
+    }
+
+    function addChatBubble(sender, text, cssClass) {
+      let box = document.getElementById("chat-box");
+      box.innerHTML += `<div class='msg ${cssClass}'><b>${sender}:</b> ${text}</div>`;
+      box.scrollTop = box.scrollHeight;
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void receivedCallback( uint32_t from, String &msg ) {
+  latestServerMessage = msg;
+}
+
+void setup() {
+  Serial.begin(115200);
+  setCpuFrequencyMhz(80); 
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+
+  mesh.setDebugMsgTypes( ERROR );
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
+  mesh.onReceive(&receivedCallback);
+
+  IPAddress myIP = mesh.getAPIP();
+  dnsServer.start(DNS_PORT, "*", myIP);
+
+  // Web Routes
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", index_html); });
+  server.on("/generate_204", []() { server.send(200, "text/html", index_html); });
+  server.on("/hotspot-detect.html", []() { server.send(200, "text/html", index_html); });
+  server.on("/success.html", []() { server.send(200, "text/html", index_html); });
+  server.on("/ncsi.txt", []() { server.send(200, "text/html", index_html); });
+
+  // --- CRUCIAL FIX HERE ---
+  server.on("/send", HTTP_POST, []() {
+    String payload = server.arg("plain");
+    mesh.sendBroadcast(payload); 
+    latestServerMessage = payload; // Now the ESP32 shares this with other phones connected to it!
+    server.send(200, "text/plain", "Sent");
+  });
+
+  server.on("/receive", HTTP_GET, []() {
+    server.send(200, "text/plain", latestServerMessage);
+  });
+
+  server.onNotFound([]() {
+    server.sendHeader("Location", String("http://") + mesh.getAPIP().toString(), true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  mesh.update();
+  server.handleClient();
+  dnsServer.processNextRequest();
+}
