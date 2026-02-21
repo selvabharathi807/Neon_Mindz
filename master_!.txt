@@ -1,0 +1,41 @@
+#include "painlessMesh.h"
+
+#define   MESH_PREFIX     "EMERGENCY_RESCUE"
+#define   MESH_PASSWORD   ""
+#define   MESH_PORT       5555
+
+Scheduler userScheduler;
+painlessMesh  mesh;
+
+void receivedCallback( uint32_t from, String &msg ) {
+  Serial.println(msg); 
+}
+
+void newConnectionCallback(uint32_t nodeId) {
+  Serial.printf("{\"sender\": \"System\", \"message\": \"New node linked up!\"}\n");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  mesh.setDebugMsgTypes(0); 
+  
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
+  
+ 
+  mesh.onReceive(&receivedCallback);
+  mesh.onNewConnection(&newConnectionCallback);
+}
+
+void loop() {
+  mesh.update();
+  
+  if (Serial.available()) {
+    String commandFromLaptop = Serial.readStringUntil('\n');
+    commandFromLaptop.trim(); 
+    
+    if(commandFromLaptop.length() > 0) {
+       mesh.sendBroadcast(commandFromLaptop);
+    }
+  }
+}
